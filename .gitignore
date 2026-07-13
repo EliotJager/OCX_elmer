@@ -1,20 +1,22 @@
-# Data files -- large, live only on the local/external disk, not in git
+# Data -- large, downloaded or generated, never committed (see DATA/README.md)
 *.nc
 
-# Generated figures -- not shared via the repo
+# Generated figures
 figures/
 
-# Old messy notebook, superseded by AnalyseMemberVsObs.ipynb (built by build_notebook.py)
-CompareModVsObs.ipynb
+# Model output staging
+outputs/
 
 # Large precomputed ensemble aggregates
-averaged_ensembles/
-averaged_ensembles3/
+jupyter/averaged_ensembles/
+jupyter/averaged_ensembles3/
+
+# Superseded: the old messy scratchpad notebook, and the generator script that
+# used to build AnalyseMemberVsObs.ipynb (the notebooks are now edited directly)
+jupyter/CompareModVsObs.ipynb
+jupyter/build_notebook.py
 
 # Jupyter / Python housekeeping
 .ipynb_checkpoints/
 __pycache__/
 *.pyc
-
-# Notebook is now edited directly; the old generator script is local-only, not published
-build_notebook.py

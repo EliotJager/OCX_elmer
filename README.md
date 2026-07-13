@@ -1,74 +1,93 @@
 # OCX_elmer
 
-Post-processing / model-vs-observation analysis for the ISMIP7 Antarctic Ice
-Sheet OCX experiment (Elmer/Ice, SSA), run on CSC LUMI/Mahti.
+Model-vs-observation analysis for ISMIP7 Antarctic Ice Sheet runs with
+**Elmer/Ice** (SSA), as run for the OCX experiment on CSC LUMI/Mahti.
 
-## What's here
+Takes a run's XIOS output and compares it against satellite observations on the
+model's own unstructured mesh: grounding-line discharge and mass balance per
+Mouginot catchment, and 2D velocity / dH/dt maps. A second notebook does
+parameter-effect and Sobol sensitivity analysis across an ensemble.
 
-- **`AnalyseMemberVsObs.ipynb`** -- the analysis notebook: compares a model
-  member's simulated ice-sheet state (velocity, dh/dt, mass balance by
-  catchment, grounding-line discharge, ...) against satellite observations
-  regridded onto the same Elmer/Ice mesh. Supports two mesh targets via a
-  config toggle at the top (`MEMBER_KIND = "ocx"` or `"smallenstrans"`).
-  §1a plots can save PNGs to `figures/` (git-ignored, not included in this
-  repo). Edited and committed directly -- there is no build step.
-  The first code cell (`# ── EDIT ME ──`) is the single place to point the
-  notebook at your own data: in particular `OCX_STATES_FILE`/`OCX_FORCING_FILE`
-  should be set to your own run's XIOS output.
-- **`build_ocx_mesh_products.py`** -- regrids the raw satellite observations
-  (`AntarcticaObsISMIP7-v1.2.nc`) and Mouginot basin definitions onto the OCX
-  Elmer mesh, producing the `obs_on_elmer_mesh*_ocx.nc` /
-  `basins_mouginotGrid_ocx.nc` files the notebook reads. Only needs rerunning
-  if your Elmer mesh differs from the one these files were built for (different
-  node/face count). Paths are hardcoded near the top of the file -- edit them
-  before rerunning.
-- **`fix_ocx_basins.py`**, **`fix_smallenstrans_obs_velocity.py`** -- one-off
-  fix scripts, kept for provenance/reproducibility of two bugs found and
-  patched in the regridded obs products (a basin-regrid CRS bug, and a frozen
-  `velocity` field caused by a stale interpolation run). See each script's
-  docstring for details.
-- **`environment.yml`** -- conda environment (`postpro_ocx`) used to run the
-  notebook and scripts. Recreate with:
-  ```bash
-  conda env create -f environment.yml
-  conda activate postpro_ocx
-  ```
+## Layout
 
-## Dependencies not in this repo
+```
+├── environment.yml            conda environment (postpro_ocx)
+├── DATA/                      all data lives here — nothing committed (see DATA/README.md)
+├── preprocessing/
+│   └── build_mesh_products.py regrid observations + basins onto YOUR mesh
+└── jupyter/
+    ├── elmer_analysis.py      shared setup: mesh geometry, flux integrators, diagnostics
+    ├── AnalyseMemberVsObs.ipynb   one run vs observations
+    └── AnalyseEnsemble.ipynb      ensemble: parameter effects & Sobol indices
+```
 
-- **ElmerUgrid** -- registers the `.ugrid.to_netcdf_forpv` accessor used by
-  `build_ocx_mesh_products.py`. Base tool by Fabien Gillet-Chaulet:
-  https://gricad-gitlab.univ-grenoble-alpes.fr/gilletcf/elmerugrid.git
-  Eliot's working copy has local, not-yet-upstreamed modifications (and isn't
-  currently in a clean, publishable state) -- if you hit reproducibility
-  issues, ask Eliot Jager for his exact copy rather than assuming the public
-  repo alone matches.
+## Getting started
 
-## Data (not included -- download separately)
+**1. Environment**
 
-Data files (`*.nc`: raw observations, regridded obs/basin products, ensemble
-aggregates) and generated figures are excluded via `.gitignore` -- they're
-large (tens of MB to several GB) and live only on the working disk, not in
-this repo.
+```bash
+conda env create -f environment.yml
+conda activate postpro_ocx
+```
 
-- **`AntarcticaObsISMIP7-v1.2.nc`** (velocity, dh/dt, BedMachine surface;
-  ~9 GB) -- ISMIP7 observations dataset for Antarctica, Mathieu Morlighem on
-  behalf of the ISMIP7 observations group. "No restrictions on access or
-  use." https://www.ismip.org/participants/focus-groups/observations
-  Place at `../DATA/AntarcticaObsISMIP7-v1.2.nc` relative to this directory
-  (i.e. `postpro/DATA/`).
-- **`AIS_discharge_BMHF14.nc`** (per-catchment grounding-line discharge;
-  ~67 MB) -- Benjamin Davison (University of Leeds / University of
-  Sheffield), product v7.0. https://doi.org/10.5281/zenodo.10051893
-  Place at `../DATA/AIS_discharge_BMHF14.nc`. If missing, the notebook skips
-  the discharge-vs-obs plots gracefully rather than failing.
-- Model output (`OCX_STATES_FILE`/`OCX_FORCING_FILE` in the notebook's config
-  cell), and the regridded basin/obs products (`basins_mouginotGrid_ocx.nc`,
-  `obs_on_elmer_mesh*_ocx.nc`) -- ask Eliot Jager, or regenerate the latter
-  with `build_ocx_mesh_products.py` against your own mesh.
+**2. ElmerUgrid** (external dependency, not on PyPI). Base tool by Fabien
+Gillet-Chaulet:
+<https://gricad-gitlab.univ-grenoble-alpes.fr/gilletcf/elmerugrid.git>. It
+registers the `.ugrid.to_netcdf_forpv` accessor used to write UGRID output.
+
+> Note: Eliot's working copy carries local modifications that are not yet
+> upstreamed, so the public repo alone may not reproduce these results exactly.
+> Ask Eliot if you hit trouble.
+
+**3. Data** — download the observations into `DATA/`, and put your XIOS output
+there too. See [`DATA/README.md`](DATA/README.md) for links and file
+descriptions.
+
+**4. Preprocessing** — the observations and basin definitions have to be
+interpolated onto your mesh once (every mesh has a different node/face count):
+
+```bash
+python preprocessing/build_mesh_products.py \
+    --states     DATA/<your_run>_states.nc \
+    --obs        DATA/AntarcticaObsISMIP7-v1.2.nc \
+    --elmerugrid /path/to/elmerugrid \
+    --outdir     DATA \
+    --tag        myrun
+```
+
+This writes `basins_mouginotGrid_myrun.nc` and `obs_on_elmer_mesh_pv_myrun.nc`
+into `DATA/`. It takes a while — the raw observation file is ~9 GB.
+
+**5. Analyse** — open `jupyter/AnalyseMemberVsObs.ipynb` and edit the single
+`CONFIG` cell at the top to point at your run and the files you just built:
+
+```python
+CONFIG = ea.Config(
+    postpro_dir      = "/path/to/elmerugrid",
+    member_kind      = "ocx",
+    ocx_states_file  = "../DATA/<your_run>_states.nc",
+    ocx_forcing_file = "../DATA/<your_run>_forcing.nc",
+    basins_file      = "../DATA/basins_mouginotGrid_myrun.nc",
+    obs_mesh_file    = "../DATA/obs_on_elmer_mesh_pv_myrun.nc",
+)
+```
+
+Nothing else in the notebook needs touching. Figures are written to
+`jupyter/figures/` (created automatically, not committed).
+
+## Notes
+
+- `elmer_analysis.py` holds everything the two notebooks share — mesh geometry,
+  node→face helpers, the grounding-line / calving flux integrators, and the
+  per-catchment mass-budget diagnostics. `ea.init(CONFIG)` loads the mesh, basins
+  and observations, and returns those names into the notebook's namespace.
+- `member_kind="smallenstrans"` switches to the SmallEnsTrans ensemble output
+  format (different variable names; cell areas computed rather than read).
+- Map panels use plain `plt.subplots()`, **not** proplot: xugrid's `.ugrid.plot()`
+  breaks on a proplot axes (`tripcolor() takes 4 positional arguments but 5 were
+  given`).
 
 ## Context
 
-This is part of the ISMIP7 Antarctic Ice Sheet projections effort using
-Elmer/Ice. See the parent project for the forward-model setup; this repo
-covers Phase 2 (model-vs-observation validation) of that work.
+Part of the ISMIP7 Antarctic Ice Sheet projections effort with Elmer/Ice
+(Phase 2: model-vs-observation validation).
