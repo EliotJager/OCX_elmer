@@ -76,6 +76,45 @@ CONFIG = ea.Config(
 Nothing else in the notebook needs touching. Figures are written to
 `jupyter/figures/` (created automatically, not committed).
 
+## Interpolation: why it is not conservative
+
+`build_mesh_products.py` uses two different methods, deliberately:
+
+| What | Method | Located on |
+|---|---|---|
+| Mouginot basins | `xugrid.OverlapRegridder`, `method="mode"` (categorical) | faces |
+| velocity, dh/dt, BedMachine surface | bilinear point-sampling (`scipy.RegularGridInterpolator`) | nodes |
+
+**The observation fields are NOT conservatively interpolated, and that is the
+right choice here.** Conservative (area-weighted) remapping preserves *integrals*
+— you want it when a quantity must not be created or destroyed, e.g. remapping
+SMB, thickness or any mass/flux field between meshes. These observations are used
+for a *pointwise* comparison instead: "what does the satellite say the velocity is
+**at this node**, versus what the model says there". For that, bilinear sampling of
+the value at the node location is what you actually want; conservative averaging
+would smear the observation over a cell and is not what is being asked.
+
+It is also far cheaper. ElmerUgrid's interpolators (`node_2_node_interpolation`,
+`face_2_face_interpolation`, ...) are **mesh-to-mesh**: they take a
+`xu.UgridDataArray` source and do polygon-polygon clipping via a celltree index.
+The observations are a structured raster of **12161 × 12161 = 148 million cells**
+at 500 m, so feeding them to those functions would first require converting the
+raster into a UGRID mesh of 148 M quad faces and then intersecting it against the
+Elmer mesh — intractable. (This is exactly why the categorical basin regrid,
+which genuinely does need an overlap method, coarsens the raster ×4 first, and is
+still the slowest step in the script.) `RegularGridInterpolator` never builds a
+mesh: it exploits the regular grid, so each of the ~929k node lookups is O(1).
+
+Gap handling is deliberate too: the data are interpolated with missing values
+filled as zero, a NaN-*fraction* field is interpolated alongside, and any node
+where more than 50% of the surrounding cells were missing is masked back to NaN.
+This tolerates small holes in the satellite coverage instead of letting one
+missing pixel poison a node.
+
+**Use a conservative method (ElmerUgrid / `OverlapRegridder`) instead whenever
+the quantity is a mass or a flux** — e.g. interpolating SMB forcing or ice
+thickness onto the mesh.
+
 ## Notes
 
 - `elmer_analysis.py` holds everything the two notebooks share — mesh geometry,
