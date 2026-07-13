@@ -1,0 +1,20 @@
+# Data files -- large, live only on the local/external disk, not in git
+*.nc
+
+# Generated figures -- not shared via the repo
+figures/
+
+# Old messy notebook, superseded by AnalyseMemberVsObs.ipynb (built by build_notebook.py)
+CompareModVsObs.ipynb
+
+# Large precomputed ensemble aggregates
+averaged_ensembles/
+averaged_ensembles3/
+
+# Jupyter / Python housekeeping
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+
+# Notebook is now edited directly; the old generator script is local-only, not published
+build_notebook.py
