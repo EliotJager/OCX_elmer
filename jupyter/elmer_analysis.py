@@ -11,8 +11,8 @@ still says out loud which run it is pointing at):
     import elmer_analysis as ea
 
     CONFIG = ea.Config(
-        postpro_dir      = "/path/to/elmerugrid",
-        ocx_states_file  = "../DATA/my_run_states.nc",
+        elmerugrid_dir = "/path/to/elmerugrid",   # only used to import ElmerUgrid
+        runs = {"baseline": ("../DATA/states_baseline.nc", "../DATA/forcing_baseline.nc")},
         ...
     )
     globals().update(ea.init(CONFIG))     # -> mesh, obs, basins, times, helpers
@@ -25,6 +25,7 @@ original notebook cells, which were validated against real runs.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from dataclasses import dataclass, field
@@ -49,7 +50,7 @@ class Config:
     """Everything that changes between runs / machines. Set this in the notebook."""
 
     # Where the ElmerUgrid tools live (registers `.ugrid.to_netcdf_forpv`).
-    postpro_dir: str
+    elmerugrid_dir: str
 
     # Mesh-specific products, built by preprocessing/build_mesh_products.py.
     basins_file: str            # Mouginot catchments regridded onto THIS mesh (faces)
@@ -109,7 +110,7 @@ def init(cfg: Config) -> dict:
     _cfg = cfg
 
     # ElmerUgrid registers .ugrid.to_netcdf_forpv and the interpolation helpers.
-    sys.path.insert(0, os.path.abspath(cfg.postpro_dir))
+    sys.path.insert(0, os.path.abspath(cfg.elmerugrid_dir))
     from ElmerUgrid import ugrid  # noqa: F401
 
     FIGURE_DIR = Path(cfg.figure_dir)
@@ -593,18 +594,26 @@ def _cache_file(label: str) -> Path:
     return Path(_cfg.cache_dir) / f"diag_{slug(label)}_{_cfg.member_kind}.nc"
 
 
-def _cache_is_fresh(cache: Path, sources) -> bool:
-    """Cache is usable only if it exists AND every source it was built from is
-    older than it. Guards the dangerous failure mode: silently plotting the
-    previous run's numbers after re-running the model."""
-    if not cache.exists():
-        return False
-    t_cache = cache.stat().st_mtime
+def _source_stamp(sources) -> str:
+    """Fingerprint of the inputs a cached diagnostic was built from: for each
+    source, its PATH, mtime and size.
+
+    Comparing mtimes against the cache file alone is not enough: if you repoint a
+    RUNS label at a different states file that happens to be OLDER than the cache,
+    an mtime-only check calls the cache fresh and you silently plot the previous
+    file's numbers. Recording the paths themselves makes that impossible -- change
+    any input, or point the same label somewhere else, and the stamp differs.
+    (Paths+mtime+size rather than a content hash: these files are ~10 GB.)"""
+    out = []
     for s in sources:
-        if s and Path(s).exists() and Path(s).stat().st_mtime > t_cache:
-            print(f"  cache stale ({Path(s).name} is newer) -> recomputing")
-            return False
-    return True
+        if not s:
+            continue
+        p = Path(s)
+        st = p.stat() if p.exists() else None
+        out.append([str(p.resolve()),
+                    int(st.st_mtime) if st else None,
+                    int(st.st_size) if st else None])
+    return json.dumps(out, sort_keys=True)
 
 
 def member_diag_dataset(run=None, fpath=None, kind=None, gl_melt=None, label=None,
@@ -635,11 +644,15 @@ def member_diag_dataset(run=None, fpath=None, kind=None, gl_melt=None, label=Non
         sources = [fpath, _cfg.basins_file]
 
     cache_path = _cache_file(label)
-    if cache and not force and _cache_is_fresh(cache_path, sources):
+    stamp = _source_stamp(sources)
+    if cache and not force and cache_path.exists():
         ds1 = xr.open_dataset(cache_path).load()
-        ds1.attrs["label"] = label
-        print(f"  {label}: loaded cached diagnostics ({cache_path})")
-        return ds1
+        if ds1.attrs.get("source_stamp") == stamp:
+            ds1.attrs["label"] = label
+            print(f"  {label}: cached ({cache_path.name})")
+            return ds1
+        print(f"  {label}: cache does not match its inputs (files changed, or the "
+              f"label now points elsewhere) -> recomputing")
 
     print(f"  {label}: computing diagnostics (minutes) ...")
     fields = load_member_fields(fpath, kind=kind, states=states, forcing=forcing)
@@ -647,7 +660,8 @@ def member_diag_dataset(run=None, fpath=None, kind=None, gl_melt=None, label=Non
     ds1 = xr.Dataset(
         {k: (["time", "catchment"], v) for k, v in diag.items()},
         coords={"time": years, "catchment": basin_ids},
-        attrs={"label": label},
+        attrs={"label": label, "source_stamp": stamp,
+               "sources": " | ".join(str(s) for s in sources if s)},
     )
     ds1["smb"]          = ds1["smb_grounded"] + ds1["smb_floating"]
     ds1["mass_balance"] = ds1["smb_grounded"] - ds1["gl_discharge"]   # grounded MB

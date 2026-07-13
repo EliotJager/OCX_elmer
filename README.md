@@ -37,7 +37,7 @@ It registers the `.ugrid.to_netcdf_forpv` accessor used to write UGRID output.
 git clone https://gricad-gitlab.univ-grenoble-alpes.fr/gilletcf/elmerugrid.git
 ```
 
-Pass its path to `--elmerugrid` (preprocessing) and `postpro_dir` (notebooks).
+Pass its path to `--elmerugrid` (preprocessing) and `elmerugrid_dir` (notebooks).
 The current `main` branch is what this repo is tested against.
 
 **3. Data** — download the observations into `DATA/`, and put your XIOS output
@@ -60,21 +60,33 @@ This writes `basins_mouginotGrid_myrun.nc` and `obs_on_elmer_mesh_pv_myrun.nc`
 into `DATA/`. It takes a while — the raw observation file is ~9 GB.
 
 **5. Analyse** — open `jupyter/AnalyseMemberVsObs.ipynb` and edit the single
-`CONFIG` cell at the top to point at your run and the files you just built:
+`CONFIG` cell at the top. Declare one entry in `RUNS` per run you want to
+compare; every per-catchment plot then draws one line per run:
 
 ```python
+RUNS = {
+    "baseline":    ("../DATA/states_baseline.nc",    "../DATA/forcing_baseline.nc"),
+    "fric0_shelf": ("../DATA/states_fric0_shelf.nc", "../DATA/forcing_fric0_shelf.nc"),
+}
+
 CONFIG = ea.Config(
-    postpro_dir      = "/path/to/elmerugrid",
-    member_kind      = "ocx",
-    ocx_states_file  = "../DATA/<your_run>_states.nc",
-    ocx_forcing_file = "../DATA/<your_run>_forcing.nc",
-    basins_file      = "../DATA/basins_mouginotGrid_myrun.nc",
-    obs_mesh_file    = "../DATA/obs_on_elmer_mesh_pv_myrun.nc",
+    elmerugrid_dir = "/path/to/elmerugrid",   # only used to import ElmerUgrid
+    member_kind    = "ocx",
+    runs           = RUNS,
+    basins_file    = "../DATA/basins_mouginotGrid_myrun.nc",
+    obs_mesh_file  = "../DATA/obs_on_elmer_mesh_pv_myrun.nc",
 )
 ```
 
 Nothing else in the notebook needs touching. Figures are written to
 `jupyter/figures/` (created automatically, not committed).
+
+The per-catchment mass budget takes minutes to compute (it reads the whole
+states+forcing files) but is only a few hundred kB, so it is **cached** to
+`jupyter/diag_cache/`. The cache records the exact source files it was built
+from, so it is rebuilt automatically whenever an input changes *or* a run label
+is repointed at a different file — you cannot silently plot stale numbers.
+`load_runs(force=True)` rebuilds regardless.
 
 ## Interpolation: why it is not conservative
 
