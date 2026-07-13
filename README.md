@@ -30,14 +30,15 @@ conda env create -f environment.yml
 conda activate postpro_ocx
 ```
 
-**2. ElmerUgrid** (external dependency, not on PyPI). Base tool by Fabien
-Gillet-Chaulet:
-<https://gricad-gitlab.univ-grenoble-alpes.fr/gilletcf/elmerugrid.git>. It
-registers the `.ugrid.to_netcdf_forpv` accessor used to write UGRID output.
+**2. ElmerUgrid** — external dependency (not on PyPI), by Fabien Gillet-Chaulet.
+It registers the `.ugrid.to_netcdf_forpv` accessor used to write UGRID output.
 
-> Note: Eliot's working copy carries local modifications that are not yet
-> upstreamed, so the public repo alone may not reproduce these results exactly.
-> Ask Eliot if you hit trouble.
+```bash
+git clone https://gricad-gitlab.univ-grenoble-alpes.fr/gilletcf/elmerugrid.git
+```
+
+Pass its path to `--elmerugrid` (preprocessing) and `postpro_dir` (notebooks).
+The current `main` branch is what this repo is tested against.
 
 **3. Data** — download the observations into `DATA/`, and put your XIOS output
 there too. See [`DATA/README.md`](DATA/README.md) for links and file
