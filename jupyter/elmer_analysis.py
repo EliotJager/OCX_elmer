@@ -59,13 +59,17 @@ class Config:
     obs_ismip_file: str = "../DATA/AntarcticaObsISMIP7-v1.2.nc"
     obs_discharge_file: str = "../DATA/AIS_discharge_BMHF14.nc"
 
-    # Which model output to analyse: "ocx" (a single XIOS run) or
-    # "smallenstrans" (one member of the SmallEnsTrans ensemble).
+    # Which model output to analyse: "ocx" (XIOS runs) or "smallenstrans"
+    # (members of the SmallEnsTrans ensemble).
     member_kind: str = "ocx"
 
-    # --- ocx: point these at YOUR XIOS output -------------------------------
-    ocx_states_file: Optional[str] = None    # geometry, velocity, groundedmask, haf, cell_area
-    ocx_forcing_file: Optional[str] = None   # smb_total_flux (face), bmb (node), ligroundf
+    # --- ocx: the runs to analyse -------------------------------------------
+    # label -> (states_file, forcing_file). Declare as many as you want to
+    # compare; the first one defines the mesh. Labels appear in plot legends
+    # and in the cached-diagnostics filenames, so keep them short and stable.
+    #   runs = {"baseline":    ("../DATA/states_ocx.nc",   "../DATA/forcing_ocx.nc"),
+    #           "fric0_shelf": ("../DATA/states_fric0.nc", "../DATA/forcing_fric0.nc")}
+    runs: dict = field(default_factory=dict)
 
     # --- smallenstrans ------------------------------------------------------
     member_dir: Optional[str] = None
@@ -74,12 +78,16 @@ class Config:
     ens_agg_file: Optional[str] = None       # per-member per-catchment budget
 
     figure_dir: str = "figures"
+    # Per-catchment diagnostics are slow to compute (minutes: the whole states +
+    # forcing files get read and integrated) but tiny to store (~100s of kB), so
+    # they are cached here. See member_diag_dataset().
+    cache_dir: str = "diag_cache"
 
     def __post_init__(self):
         if self.member_kind not in ("ocx", "smallenstrans"):
             raise ValueError(f"member_kind must be 'ocx' or 'smallenstrans', got {self.member_kind!r}")
-        if self.member_kind == "ocx" and not self.ocx_states_file:
-            raise ValueError("member_kind='ocx' requires ocx_states_file")
+        if self.member_kind == "ocx" and not self.runs:
+            raise ValueError("member_kind='ocx' requires runs={label: (states, forcing), ...}")
         if self.member_kind == "smallenstrans" and not self.member_dir:
             raise ValueError("member_kind='smallenstrans' requires member_dir")
 
@@ -121,7 +129,10 @@ def init(cfg: Config) -> dict:
 
     if cfg.member_kind == "ocx":
         member_files = []
-        MESH_REF_FILE = cfg.ocx_states_file
+        # The first declared run defines the mesh; all runs are assumed to share it
+        # (they are the same experiment with different physics, so they do).
+        MESH_REF_FILE = next(iter(cfg.runs.values()))[0]
+        print(f"Runs: {list(cfg.runs)}")
     else:
         member_files = sorted(Path(cfg.member_dir).glob(cfg.member_glob))
         print(f"Found {len(member_files)} SmallEnsTrans members")
@@ -212,6 +223,7 @@ def init(cfg: Config) -> dict:
         load_member_fields=load_member_fields,
         compute_member_diagnostics=compute_member_diagnostics,
         member_diag_dataset=member_diag_dataset,
+        load_runs=load_runs, iter_runs=iter_runs, run_files=run_files,
         load_obs_discharge=load_obs_discharge,
         get_catchment_mask=get_catchment_mask,
         get_catchment_bounds=get_catchment_bounds,
@@ -219,6 +231,7 @@ def init(cfg: Config) -> dict:
         get_obs_dhdt_at_year=get_obs_dhdt_at_year,
         load_model_snapshot_ugrid=load_model_snapshot_ugrid,
         plot_catchment_field=plot_catchment_field,
+        plot_run_diff_2d=plot_run_diff_2d,
         savefig=savefig, slug=slug,
     )
 
@@ -442,15 +455,26 @@ def calving_edge_flux(gm_face_t, u_node_t, v_node_t, h_node_t):
 
 
 # ── Member loading & diagnostics ─────────────────────────────────────────────
-def load_member_fields(fpath=None, kind=None) -> dict:
+def run_files(run: str):
+    """(states, forcing) paths for a declared ocx run label."""
+    if run not in _cfg.runs:
+        raise KeyError(f"unknown run {run!r}; declared runs: {list(_cfg.runs)}")
+    return _cfg.runs[run]
+
+
+def load_member_fields(fpath=None, kind=None, states=None, forcing=None) -> dict:
     """Open one member (any kind) -> dict of normalized (time, n_nodes/faces)
     float32 arrays (halves peak memory vs. the netCDF's native float64 -- the
-    OCX case briefly holds two large files open at once)."""
+    OCX case briefly holds two large files open at once).
+
+    ocx: pass states/forcing explicitly (see run_files()).
+    smallenstrans: pass fpath (the member file).
+    """
     kind = kind or _cfg.member_kind
     f32 = lambda a: np.asarray(a, dtype=np.float32)
     if kind == "ocx":
-        uds_s = xu.open_dataset(str(_cfg.ocx_states_file),  mask_and_scale=True, decode_times=False)
-        uds_f = xu.open_dataset(str(_cfg.ocx_forcing_file), mask_and_scale=True, decode_times=False)
+        uds_s = xu.open_dataset(str(states),  mask_and_scale=True, decode_times=False)
+        uds_f = xu.open_dataset(str(forcing), mask_and_scale=True, decode_times=False)
         u_raw, v_raw = f32(uds_s["ssavelocity_x"].values), f32(uds_s["ssavelocity_y"].values)
         fields = dict(
             h_node    = f32(uds_s["h"].values),
@@ -565,14 +589,61 @@ def compute_member_diagnostics(fields: dict, gl_melt: str = "fmp") -> dict:
     return out
 
 
-def member_diag_dataset(fpath=None, kind=None, gl_melt=None, label=None) -> xr.Dataset:
-    """Load one member (any kind) -> (time, catchment) diagnostic dataset."""
+def _cache_file(label: str) -> Path:
+    return Path(_cfg.cache_dir) / f"diag_{slug(label)}_{_cfg.member_kind}.nc"
+
+
+def _cache_is_fresh(cache: Path, sources) -> bool:
+    """Cache is usable only if it exists AND every source it was built from is
+    older than it. Guards the dangerous failure mode: silently plotting the
+    previous run's numbers after re-running the model."""
+    if not cache.exists():
+        return False
+    t_cache = cache.stat().st_mtime
+    for s in sources:
+        if s and Path(s).exists() and Path(s).stat().st_mtime > t_cache:
+            print(f"  cache stale ({Path(s).name} is newer) -> recomputing")
+            return False
+    return True
+
+
+def member_diag_dataset(run=None, fpath=None, kind=None, gl_melt=None, label=None,
+                        cache=True, force=False) -> xr.Dataset:
+    """(time, catchment) mass-budget diagnostics for one run/member.
+
+    Computing this reads the whole states+forcing files and integrates every
+    year x basin -- minutes of work -- but the RESULT is a few hundred kB. So it
+    is cached to <cache_dir>/diag_<label>_<kind>.nc and reused, unless the cache
+    is older than its inputs (or force=True).
+
+    ocx           : member_diag_dataset("baseline")   -> uses cfg.runs["baseline"]
+    smallenstrans : member_diag_dataset(fpath=...)    -> one ensemble member
+    """
     kind = kind or _cfg.member_kind
     gl_melt = gl_melt or _cfg.member_glmelt
-    fields = load_member_fields(fpath, kind=kind)
+
+    if kind == "ocx":
+        if run is None:
+            run = next(iter(_cfg.runs))            # default: the first declared run
+        states, forcing = run_files(run)
+        label = label or run
+        sources = [states, forcing, _cfg.basins_file]
+    else:
+        fpath = fpath or member_files[0]
+        states = forcing = None
+        label = label or Path(fpath).parent.name
+        sources = [fpath, _cfg.basins_file]
+
+    cache_path = _cache_file(label)
+    if cache and not force and _cache_is_fresh(cache_path, sources):
+        ds1 = xr.open_dataset(cache_path).load()
+        ds1.attrs["label"] = label
+        print(f"  {label}: loaded cached diagnostics ({cache_path})")
+        return ds1
+
+    print(f"  {label}: computing diagnostics (minutes) ...")
+    fields = load_member_fields(fpath, kind=kind, states=states, forcing=forcing)
     diag   = compute_member_diagnostics(fields, gl_melt=gl_melt)
-    if label is None:
-        label = "OCX C011" if kind == "ocx" else Path(fpath or member_files[0]).parent.name
     ds1 = xr.Dataset(
         {k: (["time", "catchment"], v) for k, v in diag.items()},
         coords={"time": years, "catchment": basin_ids},
@@ -580,7 +651,45 @@ def member_diag_dataset(fpath=None, kind=None, gl_melt=None, label=None) -> xr.D
     )
     ds1["smb"]          = ds1["smb_grounded"] + ds1["smb_floating"]
     ds1["mass_balance"] = ds1["smb_grounded"] - ds1["gl_discharge"]   # grounded MB
+
+    if cache:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        ds1.to_netcdf(cache_path)
+        print(f"  {label}: cached -> {cache_path}")
     return ds1
+
+
+def load_runs(runs=None, force=False) -> xr.Dataset:
+    """All declared ocx runs as ONE dataset with a `run` dimension.
+
+    Mirrors the shape the §2 ensemble code already uses (a `simu` dim), so the
+    same plotting/aggregation idioms work on both. Cached, so re-running the
+    cell is instant.
+
+        members = load_runs()
+        members.sel(run="fric0_shelf")["gl_discharge"]
+        members["gl_discharge"].diff("run")        # run-to-run difference
+    """
+    runs = runs or list(_cfg.runs)
+    if isinstance(runs, dict):
+        runs = list(runs)
+    out = []
+    for label in runs:
+        ds1 = member_diag_dataset(run=label, force=force)
+        out.append(ds1.expand_dims(run=[label]))
+    ds = xr.concat(out, dim="run")
+    ds.attrs["label"] = " vs ".join(runs) if len(runs) > 1 else runs[0]
+    return ds
+
+
+def iter_runs(members):
+    """Yield (label, dataset) whether `members` has a `run` dim or is a single run.
+    Lets one plotting function serve both cases."""
+    if "run" in getattr(members, "dims", ()):
+        for r in members["run"].values:
+            yield str(r), members.sel(run=r)
+    else:
+        yield members.attrs.get("label", "member"), members
 
 
 # ── Observed discharge (BMHF14 / IMBIE) ──────────────────────────────────────
@@ -702,3 +811,47 @@ def plot_catchment_field(ax, da, catchment: int, xlim, ylim, cmap, vmin, vmax):
     ax.set_xlim(xlim); ax.set_ylim(ylim)
     ax.set_aspect("equal"); ax.axis("off"); ax.set_title("")
     return p
+
+
+def plot_run_diff_2d(run_a: str, run_b: str, catchment: int, year: float,
+                     variable: str = "velocity", cmap_abs="viridis", cmap_diff="RdBu_r",
+                     vmax_abs=None, vmax_diff=None, save=True):
+    """3-panel map for one catchment: run_a | run_b | (run_a - run_b).
+
+    Answers "where did this physics change actually do something" -- e.g. how
+    zeroing the friction under the shelves redistributes velocity. Uses the same
+    clip_box path as the obs maps, and plain matplotlib axes (NOT proplot; see
+    plot_catchment_field)."""
+    xlim, ylim = get_catchment_bounds(catchment)
+    t_idx = int(np.argmin(np.abs(times - year)))
+
+    da_a = load_model_snapshot_ugrid(run_files(run_a)[0], variable, t_idx, kind="ocx")
+    da_b = load_model_snapshot_ugrid(run_files(run_b)[0], variable, t_idx, kind="ocx")
+    da_d = da_a - da_b
+
+    m = get_catchment_mask(catchment)
+    if vmax_abs is None:
+        a = np.concatenate([da_a.values[m], da_b.values[m]])
+        vmax_abs = np.nanpercentile(a[np.isfinite(a)], 98)
+    if vmax_diff is None:
+        d = da_d.values[m]
+        d = d[np.isfinite(d)]
+        vmax_diff = np.nanpercentile(np.abs(d), 95) if d.size else 1.0
+        vmax_diff = max(vmax_diff, 1e-12)          # all-zero diff -> avoid vmin==vmax
+    vmin_abs = 0.0 if variable == "velocity" else -vmax_abs
+
+    fig, axes = plt.subplots(ncols=3, figsize=(15, 5))
+    p0 = plot_catchment_field(axes[0], da_a, catchment, xlim, ylim, cmap_abs, vmin_abs, vmax_abs)
+    p1 = plot_catchment_field(axes[1], da_b, catchment, xlim, ylim, cmap_abs, vmin_abs, vmax_abs)
+    p2 = plot_catchment_field(axes[2], da_d, catchment, xlim, ylim, cmap_diff, -vmax_diff, vmax_diff)
+    axes[0].set_title(f"{run_a}  {int(times[t_idx])}", fontsize=9)
+    axes[1].set_title(f"{run_b}  {int(times[t_idx])}", fontsize=9)
+    axes[2].set_title(f"{run_a} − {run_b}", fontsize=9)
+    fig.colorbar(p1, ax=[axes[0], axes[1]], location="bottom", shrink=0.6, label=variable)
+    fig.colorbar(p2, ax=axes[2], location="bottom", shrink=0.6, label="difference")
+
+    mean_diff = np.nanmean(da_d.values[m])
+    fig.suptitle(f"{variable} — catchment {catchment} — mean diff {mean_diff:+.3g}", fontsize=12)
+    if save:
+        savefig(fig, f"1b_{variable}_diff_{slug(run_a)}_vs_{slug(run_b)}_c{catchment}_{int(times[t_idx])}")
+    return fig, axes

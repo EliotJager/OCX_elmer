@@ -20,3 +20,6 @@ jupyter/build_notebook.py
 .ipynb_checkpoints/
 __pycache__/
 *.pyc
+
+# Cached per-catchment diagnostics (regenerated on demand)
+jupyter/diag_cache/
