@@ -44,6 +44,14 @@ RHO_SW = 1028.0     # kg m-3
 GT = 1e-12          # kg -> Gt
 V_FILL_THRESHOLD = 30000.0   # |velocity| above this = fill/garbage node -> mask
 
+# Bump this whenever compute_member_diagnostics() changes what it computes.
+# It goes into the cache stamp, so a definition change invalidates every cached
+# diagnostic -- otherwise the cache would happily keep serving numbers computed
+# by the OLD recipe (the source files have not changed, only the code has).
+#   v2 (2026-07-13): gl_discharge now comes from Elmer's own `ligroundf` field
+#                    for OCX runs, instead of the edge-reconstruction method.
+RECIPE_VERSION = 2
+
 
 @dataclass
 class Config:
@@ -488,6 +496,9 @@ def load_member_fields(fpath=None, kind=None, states=None, forcing=None) -> dict
             bmb_node  = f32(uds_f["bmb"].values),
             smb_face  = f32(uds_f["smb_total_flux"].values),   # already face-located
             smb_node  = None,
+            # Elmer's own grounding-line flux diagnostic (face-located, m ice a-1).
+            # This is THE GL discharge -- see compute_member_diagnostics.
+            ligroundf_face = f32(uds_f["ligroundf"].values) if "ligroundf" in uds_f else None,
         )
         uds_s.close(); uds_f.close()
         return fields
@@ -529,6 +540,7 @@ def compute_member_diagnostics(fields: dict, gl_melt: str = "fmp") -> dict:
     bmb_node = fields["bmb_node"]
     smb_face_all, smb_node = fields.get("smb_face"), fields.get("smb_node")
     haf_node = fields.get("haf_node")
+    ligroundf = fields.get("ligroundf_face")
     a = face_areas                                        # (n_faces,) static
 
     out = {k: np.zeros((n_time, n_basins)) for k in [
@@ -566,8 +578,23 @@ def compute_member_diagnostics(fields: dict, gl_melt: str = "fmp") -> dict:
         grounded_mass_face_t = np.where(grounded_t, h_face_t, 0.) * a * RHO_ICE * GT
         shelf_mass_face_t    = np.where(floating_t, h_face_t, 0.) * a * RHO_ICE * GT
 
-        gl_t = gl_discharge_one_step(gm_face_t, u_node[t], v_node[t], h_node[t],
-                                     basins, basin_ids)
+        # Grounding-line discharge.
+        # PREFERRED: Elmer's own `ligroundf` field (face-located, m ice a-1) -- this is
+        # the model's internal GL flux diagnostic, computed with its sub-element
+        # grounding-line treatment, and it is the field that gets submitted to ISMIP.
+        # Only outflow is counted (ligroundf > 0), i.e. this is GROSS discharge, the
+        # standard definition. NB the discarded negatives are NOT small (~450 Gt/yr in
+        # the baseline, ~1770 in fric0_shelf) -- what they represent is not yet
+        # established, so do not quote a "net" number without checking that first.
+        # FALLBACK (SmallEnsTrans, which has no ligroundf): reconstruct the flux by
+        # integrating u.n * h over the grounding-line edges. Agrees with ligroundf to
+        # within ~4-6%; the difference lives in the GL-straddling elements, where the
+        # face-averaged grounded mask and Elmer's sub-element GL disagree.
+        if ligroundf is None:
+            gl_t = gl_discharge_one_step(gm_face_t, u_node[t], v_node[t], h_node[t],
+                                         basins, basin_ids)
+        else:
+            gl_face_t = np.where(ligroundf[t] > 0, ligroundf[t], 0.0) * a * RHO_ICE * GT
         _, calv_edge_t = calving_edge_flux(gm_face_t, u_node[t], v_node[t], h_node[t])
 
         for i, bid in enumerate(basin_ids):
@@ -585,7 +612,8 @@ def compute_member_diagnostics(fields: dict, gl_melt: str = "fmp") -> dict:
             out["bmb_floating"]  [t, i] = np.nansum(bmb_face_t[mf] * a[mf]) * RHO_ICE * GT
             out["calving_face"]  [t, i] = np.nansum(calv_face[t, mf] * a[mf]) * RHO_ICE * GT
             out["calving_edge"]  [t, i] = calv_edge_t[i]
-            out["gl_discharge"]  [t, i] = gl_t[i]
+            out["gl_discharge"]  [t, i] = (np.nansum(gl_face_t[m]) if ligroundf is not None
+                                           else gl_t[i])
 
     return out
 
@@ -604,7 +632,7 @@ def _source_stamp(sources) -> str:
     file's numbers. Recording the paths themselves makes that impossible -- change
     any input, or point the same label somewhere else, and the stamp differs.
     (Paths+mtime+size rather than a content hash: these files are ~10 GB.)"""
-    out = []
+    out = [["recipe_version", RECIPE_VERSION, None]]
     for s in sources:
         if not s:
             continue
