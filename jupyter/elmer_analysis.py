@@ -50,7 +50,10 @@ V_FILL_THRESHOLD = 30000.0   # |velocity| above this = fill/garbage node -> mask
 # by the OLD recipe (the source files have not changed, only the code has).
 #   v2 (2026-07-13): gl_discharge now comes from Elmer's own `ligroundf` field
 #                    for OCX runs, instead of the edge-reconstruction method.
-RECIPE_VERSION = 2
+#   v3 (2026-07-14): gl_discharge sums ligroundf with ALL SIGNS (net flux around
+#                    the GL contour), matching Elmer's own tendligroundf, instead
+#                    of counting only ligroundf > 0 (gross).
+RECIPE_VERSION = 3
 
 
 @dataclass
@@ -578,23 +581,31 @@ def compute_member_diagnostics(fields: dict, gl_melt: str = "fmp") -> dict:
         grounded_mass_face_t = np.where(grounded_t, h_face_t, 0.) * a * RHO_ICE * GT
         shelf_mass_face_t    = np.where(floating_t, h_face_t, 0.) * a * RHO_ICE * GT
 
-        # Grounding-line discharge.
-        # PREFERRED: Elmer's own `ligroundf` field (face-located, m ice a-1) -- this is
-        # the model's internal GL flux diagnostic, computed with its sub-element
-        # grounding-line treatment, and it is the field that gets submitted to ISMIP.
-        # Only outflow is counted (ligroundf > 0), i.e. this is GROSS discharge, the
-        # standard definition. NB the discarded negatives are NOT small (~450 Gt/yr in
-        # the baseline, ~1770 in fric0_shelf) -- what they represent is not yet
-        # established, so do not quote a "net" number without checking that first.
-        # FALLBACK (SmallEnsTrans, which has no ligroundf): reconstruct the flux by
-        # integrating u.n * h over the grounding-line edges. Agrees with ligroundf to
-        # within ~4-6%; the difference lives in the GL-straddling elements, where the
-        # face-averaged grounded mask and Elmer's sub-element GL disagree.
+        # Grounding-line discharge, from Elmer's own `ligroundf` field (face-located).
+        #
+        # ComputeGLFlux_2D (elmerice/Utils/ComputeFluxUtils.F90) integrates
+        # h * (u . n) along each GL-straddling element's grounding-line edge and
+        # stores Flux/element_area, so ligroundf * face_area recovers the flux.
+        #
+        # SUM ALL SIGNS -- including the negatives. ligroundf is genuinely negative on
+        # some elements because `u . n` is the flow component normal to that particular
+        # GL segment, and the grounding line is a convoluted contour that the ice does
+        # not cross perpendicularly everywhere (oblique flow, re-entrant bays,
+        # promontories). The meaningful quantity is the flux integrated AROUND the
+        # contour, which is exactly what Elmer's own global diagnostic does:
+        #     tendligroundf = tendligroundf + Flux      ! no sign filter
+        # Filtering to ligroundf > 0 would give a "gross" discharge Elmer never
+        # computes, and the discarded inflow is large (~450 Gt/yr baseline, ~1770 in
+        # fric0_shelf), which flips model-vs-obs conclusions. So: net, matching Elmer.
+        #
+        # FALLBACK (SmallEnsTrans has no ligroundf): reconstruct by integrating u.n * h
+        # over the GL edges. NB that fallback still counts outflow only, so it is a
+        # GROSS estimate and is not directly comparable to the ligroundf-based number.
         if ligroundf is None:
             gl_t = gl_discharge_one_step(gm_face_t, u_node[t], v_node[t], h_node[t],
                                          basins, basin_ids)
         else:
-            gl_face_t = np.where(ligroundf[t] > 0, ligroundf[t], 0.0) * a * RHO_ICE * GT
+            gl_face_t = np.nan_to_num(ligroundf[t]) * a * RHO_ICE * GT
         _, calv_edge_t = calving_edge_flux(gm_face_t, u_node[t], v_node[t], h_node[t])
 
         for i, bid in enumerate(basin_ids):
@@ -674,7 +685,11 @@ def member_diag_dataset(run=None, fpath=None, kind=None, gl_melt=None, label=Non
     cache_path = _cache_file(label)
     stamp = _source_stamp(sources)
     if cache and not force and cache_path.exists():
-        ds1 = xr.open_dataset(cache_path).load()
+        # Context manager, so the file handle is CLOSED before we might rewrite this
+        # same path below: xarray keeps opened files in an LRU cache, and writing to a
+        # path it still holds open fails with PermissionError on this (exFAT) disk.
+        with xr.open_dataset(cache_path) as _ds:
+            ds1 = _ds.load()
         if ds1.attrs.get("source_stamp") == stamp:
             ds1.attrs["label"] = label
             print(f"  {label}: cached ({cache_path.name})")
@@ -696,7 +711,12 @@ def member_diag_dataset(run=None, fpath=None, kind=None, gl_melt=None, label=Non
 
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        ds1.to_netcdf(cache_path)
+        # Write to a temp path, then replace: never write onto a path we just read
+        # (see the open_dataset comment above), and a crash mid-write cannot leave a
+        # half-written cache that would later be read as if it were valid.
+        tmp = cache_path.with_suffix(".tmp.nc")
+        ds1.to_netcdf(tmp)
+        os.replace(tmp, cache_path)
         print(f"  {label}: cached -> {cache_path}")
     return ds1
 
